@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch Party</title>
+<style>
+  [hidden] { display: none !important; }
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; }
+  video { width: 100%; background: #000; border-radius: 8px; }
+  #ytwrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; overflow: hidden; }
+  #ytwrap iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  .row { display: flex; gap: 8px; margin: 12px 0; }
+  input { flex: 1; padding: 8px; }
+  #status { font-size: 13px; color: #666; }
+</style>
+</head>
+<body>
+<h2>Watch Party</h2>
+<div class="row">
+  <input id="room" placeholder="room id" value="demo">
+  <button id="join">Join</button>
+</div>
+<div class="row">
+  <input id="url" placeholder="video URL (YouTube, .mp4, .webm, .m3u8)">
+  <button id="load">Load for everyone</button>
+</div>
+<video id="v" controls playsinline></video>
+<div id="ytwrap" hidden><div id="yt"></div></div>
+<p id="status">Not connected</p>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const v = $("v");
+const ytWrap = $("ytwrap");
+const status = (t) => ($("status").textContent = t);
+
+let ws = null;
+let heartbeat = null;
+let hls = null;
+let cur = null;            // active player adapter (html5 or yt)
+const DRIFT = 0.5;         // seconds of tolerated drift (HTML5)
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+// User-originated player events go out to the room through here.
+const emit = (type, position) => send({ type, position });
+
+/* ------------------------------------------------------------------ */
+/* URL handling                                                        */
+/* ------------------------------------------------------------------ */
+function youtubeId(x, host) {
+  let id = null;
+  if (host === "youtu.be") id = x.pathname.slice(1).split("/")[0];
+  else if (x.pathname === "/watch") id = x.searchParams.get("v");
+  else {
+    const m = x.pathname.match(/^\/(?:embed|shorts|live|v)\/([^/?]+)/);
+    if (m) id = m[1];
+  }
+  return id && /^[\w-]{11}$/.test(id) ? id : null;
+}
+
+// Returns {url, kind, id?, note?} or {error}.
+function normalizeUrl(raw) {
+  const u = (raw || "").trim();
+  let x;
+  try { x = new URL(u); } catch { return { error: "That doesn't look like a valid URL." }; }
+  const host = x.hostname.replace(/^www\./, "");
+
+  if (host === "youtu.be" || host === "youtube.com" || host.endsWith(".youtube.com")) {
+    const id = youtubeId(x, host);
+    if (!id) return { error: "Couldn't find a video in that YouTube link. Open the video itself and copy its link." };
+    return {
+      kind: "youtube", id,
+      url: `https://www.youtube.com/watch?v=${id}`,
+      note: x.searchParams.has("list") ? "Loading just this video (playlist part of the link is ignored)…" : "Loading YouTube video…",
+    };
+  }
+  if (host === "drive.google.com")
+    return { error: "Google Drive links aren't direct video files and are throttled. Use a direct .mp4/.webm link or object storage." };
+  if (host === "github.com") {
+    const m = x.pathname.match(/^\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+)$/);
+    if (m) return { kind: "video", url: `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}`, note: "Converted GitHub link to raw file URL." };
+    return { error: "That GitHub link isn't a file. Use a link to a video file (…/blob/main/video.mp4)." };
+  }
+  if (host.endsWith("dropbox.com")) {
+    x.searchParams.delete("dl"); x.searchParams.set("raw", "1");
+    return { kind: "video", url: x.toString(), note: "Converted Dropbox link to direct file URL." };
+  }
+  return { kind: "video", url: u };
+}
+
+const MEDIA_ERRORS = {
+  1: "loading was aborted",
+  2: "network error (blocked, offline, or the server refused the request)",
+  3: "the file is corrupt or uses a codec this browser can't decode",
+  4: "the link isn't a direct video file, or the format/codec isn't supported",
+};
+
+/* ------------------------------------------------------------------ */
+/* Adapter 1: HTML5 <video>                                            */
+/* ------------------------------------------------------------------ */
+const html5 = (() => {
+  // Per-event-type echo guard: a remote action mutes only the specific local event it will
+  // trigger, briefly, so a genuine user action right after a remote one is never swallowed.
+  const muteUntil = { play: 0, pause: 0, seeked: 0 };
+  const mute = (t) => (muteUntil[t] = performance.now() + 400);
+  const muted = (t) => {
+    if (performance.now() < muteUntil[t]) { muteUntil[t] = 0; return true; }
+    return false;
+  };
+
+  v.onplay   = () => cur === html5 && !muted("play")   && emit("play",  v.currentTime);
+  v.onpause  = () => cur === html5 && !muted("pause")  && emit("pause", v.currentTime);
+  v.onseeked = () => cur === html5 && !muted("seeked") && emit("seek",  v.currentTime);
+  v.onloadeddata = () => cur === html5 && status("Video ready");
+  v.onerror = () => {
+    if (cur !== html5) return;
+    const e = v.error;
+    status(`⚠ Can't play this video: ${MEDIA_ERRORS[e && e.code] || "unknown error"}` + (e && e.code ? ` (code ${e.code})` : ""));
+  };
+
+  function seek(pos) {
+    if (Math.abs(v.currentTime - pos) > 0.05) { mute("seeked"); v.currentTime = pos; }
+  }
+  return {
+    show() { v.hidden = false; ytWrap.hidden = true; },
+    load(url) {
+      if (hls) { hls.destroy(); hls = null; }
+      if (url.split("?")[0].endsWith(".m3u8") && !v.canPlayType("application/vnd.apple.mpegurl")) {
+        if (window.Hls && Hls.isSupported()) {
+          hls = new Hls(); hls.loadSource(url); hls.attachMedia(v);
+          hls.on(Hls.Events.ERROR, (_, d) => d.fatal && status("⚠ HLS error: " + d.details));
+        } else {
+          status("⚠ HLS isn't available (hls.js failed to load or isn't supported).");
+          return false;
+        }
+      } else {
+        v.src = url;
+      }
+      return true;
+    },
+    stop() {
+      if (!v.paused) { mute("pause"); v.pause(); }
+      if (hls) { hls.destroy(); hls = null; }
+      v.removeAttribute("src"); v.load();
+    },
+    time: () => v.currentTime,
+    isPlaying: () => !v.paused,
+    seek,
+    play(pos) {
+      if (pos != null) seek(pos);
+      if (v.paused) { mute("play"); v.play().catch(() => status("Click play once to allow autoplay")); }
+    },
+    pause(pos) {
+      if (pos != null) seek(pos);
+      if (!v.paused) { mute("pause"); v.pause(); }
+    },
+    nudge(pos) { if (Math.abs(v.currentTime - pos) > DRIFT) seek(pos); },
+  };
+})();
+
+/* ------------------------------------------------------------------ */
+/* Adapter 2: YouTube IFrame API                                       */
+/* The API has no "seeked" event, so seeks are detected by polling:    */
+/* if the player time differs from where it should be, the user seeked.*/
+/* ------------------------------------------------------------------ */
+const yt = (() => {
+  let player = null;
+  let ready = false;            // player can accept commands for the current video
+  let queue = [];               // commands issued before ready
+  let videoId = null;
+  let apiPromise = null;
+  let logicalPlaying = false;   // what the room thinks we're doing; updated on remote commands too
+  let lastT = 0, lastNow = 0;   // baseline for seek detection
+  let lockUntil = 0;            // after a remote command, don't treat stray state changes as user input
+  let pollId = null;
+
+  const baseline = (t) => { lastT = t; lastNow = performance.now(); };
+  const lock = () => (lockUntil = performance.now() + 1200);
+  const run = (fn) => (ready ? fn() : queue.push(fn));
+  function flush() {
+    ready = true;
+    status("YouTube video ready");
+    const q = queue; queue = [];
+    q.forEach((f) => f());
+  }
+
+  function loadApi() {
+    if (apiPromise) return apiPromise;
+    apiPromise = new Promise((resolve, reject) => {
+      if (window.YT && YT.Player) return resolve();
+      window.onYouTubeIframeAPIReady = resolve;
+      const s = document.createElement("script");
+      s.src = "https://www.youtube.com/iframe_api";
+      s.onerror = () => { apiPromise = null; reject(new Error("Couldn't load the YouTube player (offline or blocked).")); };
+      document.head.appendChild(s);
+    });
+    return apiPromise;
+  }
+
+  const YT_ERRORS = {
+    2: "invalid video ID",
+    5: "the YouTube player hit an internal error",
+    100: "video not found or private",
+    101: "the owner doesn't allow this video to be embedded",
+    150: "the owner doesn't allow this video to be embedded",
+  };
+
+  function onState(e) {
+    if (cur !== yt || !player) return;
+    const s = e.data;            // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+    const t = player.getCurrentTime();
+    if (s === 1) {
+      if (!logicalPlaying) {
+        if (performance.now() < lockUntil) { player.pauseVideo(); return; }  // spurious start right after a remote pause/seek
+        logicalPlaying = true; baseline(t); emit("play", t);
+      }
+    } else if (s === 2) {
+      if (logicalPlaying && performance.now() >= lockUntil) {
+        logicalPlaying = false; baseline(t); emit("pause", t);
+      }
+    } else if (s === 0) {
+      logicalPlaying = false;
+    } else if (s === 5 && !ready) {
+      flush();
+    }
+  }
+
+  function poll() {
+    if (cur !== yt || !ready || !player || !player.getCurrentTime) return;
+    const st = player.getPlayerState();
+    const t = player.getCurrentTime(), now = performance.now();
+    if (st === 3) { baseline(t); return; }               // buffering: don't judge
+    const rate = player.getPlaybackRate ? player.getPlaybackRate() : 1;
+    const expected = lastT + (logicalPlaying && st === 1 ? ((now - lastNow) / 1000) * rate : 0);
+    if (Math.abs(t - expected) > 1.5) emit("seek", t);
+    baseline(t);
+  }
+
+  function blockedCheck() {
+    if (cur === yt && player && logicalPlaying && ![1, 3].includes(player.getPlayerState()))
+      status("Click the video once to allow playback (browser autoplay policy).");
+  }
+
+  return {
+    show() { v.hidden = true; ytWrap.hidden = false; },
+    async load(id) {
+      videoId = id; ready = false; queue = []; logicalPlaying = false; baseline(0);
+      await loadApi();
+      if (videoId !== id) return;                         // superseded by a newer load
+      if (!player) {
+        player = new YT.Player("yt", {
+          videoId: id,
+          playerVars: { playsinline: 1, rel: 0 },
+          events: {
+            onReady: () => { if (videoId === id) flush(); },
+            onStateChange: onState,
+            onError: (e) => status("⚠ YouTube: " + (YT_ERRORS[e.data] || "playback error " + e.data)),
+          },
+        });
+        pollId = setInterval(poll, 500);
+      } else {
+        player.cueVideoById(id);
+        setTimeout(() => { if (!ready && videoId === id) flush(); }, 3000);
+      }
+    },
+    stop() {
+      videoId = null; logicalPlaying = false; queue = []; ready = false;
+      try { player && player.pauseVideo(); } catch {}
+    },
+    time: () => (player && ready ? player.getCurrentTime() : 0),
+    isPlaying: () => !!(player && ready && logicalPlaying && player.getPlayerState() === 1),
+    seek(pos) { run(() => { lock(); player.seekTo(pos, true); baseline(pos); }); },
+    play(pos) {
+      run(() => {
+        lock(); logicalPlaying = true;
+        if (pos != null) player.seekTo(pos, true);
+        baseline(pos != null ? pos : player.getCurrentTime());
+        player.playVideo();
+        setTimeout(blockedCheck, 1500);
+      });
+    },
+    pause(pos) {
+      run(() => {
+        lock(); logicalPlaying = false;
+        if (pos != null) player.seekTo(pos, true);
+        baseline(pos != null ? pos : player.getCurrentTime());
+        player.pauseVideo();
+      });
+    },
+    nudge(pos) {
+      run(() => { if (Math.abs(player.getCurrentTime() - pos) > 1.0) { player.seekTo(pos, true); baseline(pos); } });
+    },
+  };
+})();
+
+/* ------------------------------------------------------------------ */
+/* Source loading (picks the adapter)                                  */
+/* ------------------------------------------------------------------ */
+// Returns the canonical URL that was loaded, or false if it was rejected.
+async function loadSource(raw) {
+  if (!raw) return false;
+  const r = normalizeUrl(raw);
+  if (r.error) { status("⚠ " + r.error); return false; }
+  $("url").value = r.url;
+
+  const next = r.kind === "youtube" ? yt : html5;
+  if (cur && cur !== next) cur.stop();
+  cur = next;
+  cur.show();
+  status(r.note || "Loading video…");
+
+  if (r.kind === "youtube") {
+    try { await yt.load(r.id); } catch (e) { status("⚠ " + e.message); return false; }
+    return r.url;
+  }
+  return html5.load(r.url) ? r.url : false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Room connection                                                     */
+/* ------------------------------------------------------------------ */
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/${encodeURIComponent($("room").value)}`);
+  ws.onopen = () => {
+    status("Connected to room " + $("room").value);
+    clearInterval(heartbeat);
+    heartbeat = setInterval(() => {
+      if (cur && cur.isPlaying()) send({ type: "time", position: cur.time() });
+    }, 3000);
+  };
+  ws.onclose = () => { status("Disconnected"); clearInterval(heartbeat); };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === "state") {
+      if (m.url) loadSource(m.url);                 // async for YouTube; later commands queue until ready
+      if (!cur) return;
+      if (m.playing) cur.play(m.position || 0); else cur.pause(m.position || 0);
+    } else if (m.type === "load") {
+      loadSource(m.url);
+    } else if (!cur) {
+      return;
+    } else if (m.type === "play") {
+      cur.play(m.position);
+    } else if (m.type === "pause") {
+      cur.pause(m.position);
+    } else if (m.type === "seek") {
+      cur.seek(m.position);
+    } else if (m.type === "time") {
+      cur.nudge(m.position);
+    }
+  };
+}
+
+$("join").onclick = () => { if (ws) ws.close(); connect(); };
+$("load").onclick = async () => {
+  const url = await loadSource($("url").value);   // canonical URL, or false if rejected
+  if (url) send({ type: "load", url, position: 0 });
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1" defer></script>
+</body>
+</html>
