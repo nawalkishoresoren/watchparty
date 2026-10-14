@@ -885,7 +885,12 @@ function stopWatching(id) {
 /* ------------------------------------------------------------------ */
 // STUN finds the route between two browsers. Add a TURN server here if people on strict
 // networks (some offices, some mobile carriers) can't hear or see each other.
-const ICE = [{ urls: "stun:stun.l.google.com:19302" }];
+const ICE = [
+  { urls: "stun:stun.l.google.com:19302" },
+  // TURN relay: replace the three YOUR_* values with the details from your TURN provider.
+  { urls: ["turn:YOUR_TURN_HOST:443?transport=tcp", "turns:YOUR_TURN_HOST:443?transport=tcp"],
+    username: "YOUR_USER", credential: "YOUR_PASS" },
+];
 const peers = new Map();                 // id -> {pc, polite, making, ignore, stream, senders}
 
 function signal(to, data) { send({ type: "signal", to, data }); }
@@ -921,7 +926,10 @@ function ensurePeer(id) {
     const t = tiles.get(id);
     if (t) t.video.play().catch(() => {});
   };
-  pc.onconnectionstatechange = () => { if (pc.connectionState === "failed") pc.restartIce(); };
+  pc.onconnectionstatechange = () => {
+    toast(`Call link: ${pc.connectionState}`);   // temporary: shows the state on the tablet, remove once calls work
+    if (pc.connectionState === "failed") pc.restartIce();
+  };
 
   const t = tiles.get(id);
   if (t) t.video.srcObject = p.stream;
